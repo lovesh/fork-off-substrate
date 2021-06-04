@@ -2,19 +2,31 @@ const fs = require('fs');
 const path = require('path');
 const chalk = require('chalk');
 const cliProgress = require('cli-progress');
+
 require("dotenv").config();
+
 const { ApiPromise } = require('@polkadot/api');
 const { HttpProvider } = require('@polkadot/rpc-provider');
 const { xxhashAsHex } = require('@polkadot/util-crypto');
+
+const {TypeRegistry} = require('@polkadot/types');
+const {getSpecTypes} = require('@polkadot/types-known');
+const {createMetadata} = require('@substrate/txwrapper/lib/util/metadata');
+
 const execFileSync = require('child_process').execFileSync;
 const execSync = require('child_process').execSync;
+
 const binaryPath = path.join(__dirname, 'data', 'binary');
 const wasmPath = path.join(__dirname, 'data', 'runtime.wasm');
 const schemaPath = path.join(__dirname, 'data', 'schema.json');
+// Path of metadata of the chain that is being forked.
+const metadataPath = path.join(__dirname, 'data', 'metadata.json');
 const hexPath = path.join(__dirname, 'data', 'runtime.hex');
 const originalSpecPath = path.join(__dirname, 'data', 'genesis.json');
 const forkedSpecPath = path.join(__dirname, 'data', 'fork.json');
 const storagePath = path.join(__dirname, 'data', 'storage.json');
+
+const {MAINNET_INFO, TESTNET_INFO, DEVNODE_INFO} = require('./chain_info');
 
 // Using http endpoint since substrate's Ws endpoint has a size limit.
 const provider = new HttpProvider(process.env.HTTP_RPC_ENDPOINT || 'http://localhost:9933')
@@ -25,6 +37,19 @@ const totalChunks = Math.pow(256, chunksLevel);
 let chunksFetched = 0;
 let separator = false;
 const progressBar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic);
+
+const chainSpecName = process.env.CHAIN_SPEC_NAME || 'local_poa_testnet';
+
+let chainInfo;
+
+// Deliberately not typing up `chainInfo` with `chainSpecName`
+if (process.env.CHAIN_TYPE === 'testnet') {
+  chainInfo = TESTNET_INFO;
+} else if (process.env.CHAIN_TYPE === 'mainnet') {
+  chainInfo = MAINNET_INFO;
+} else {
+  chainInfo = DEVNODE_INFO
+}
 
 /**
  * All module prefixes except those mentioned in the skippedModulesPrefix will be added to this by the script.
@@ -40,7 +65,7 @@ const progressBar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_cla
  * e.g. console.log(xxhashAsHex('System', 128)).
  */
 let prefixes = ['0x26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9' /* System.Account */];
-const skippedModulesPrefix = ['System', 'Session', 'Babe', 'Grandpa', 'GrandpaFinality', 'FinalityTracker'];
+const skippedModulesPrefix = ['System', 'Session', 'Aura', 'Grandpa', 'GrandpaFinality', 'FinalityTracker'];
 
 async function main() {
   if (!fs.existsSync(binaryPath)) {
@@ -56,17 +81,37 @@ async function main() {
   execSync('cat ' + wasmPath + ' | hexdump -ve \'/1 "%02x"\' > ' + hexPath);
 
   let api;
+  let registry
   console.log(chalk.green('We are intentionally using the HTTP endpoint. If you see any warnings about that, please ignore them.'));
   if (!fs.existsSync(schemaPath)) {
     console.log(chalk.yellow('Custom Schema missing, using default schema.'));
     api = await ApiPromise.create({ provider });
   } else {
-    const { types, rpc } = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+    // Can't use API object as the chain is already bricked.
+
+    /* const { types, rpc } = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
     api = await ApiPromise.create({
       provider,
       types,
       rpc,
+    }); */
+    const types = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+    registry = new TypeRegistry();
+    registry.setChainProperties(
+      registry.createType(
+        'ChainProperties',
+        chainInfo.properties,
+      ),
+    );
+
+    registry.setKnownTypes({
+      types,
     });
+    registry.register(getSpecTypes(registry, chainInfo.name, chainInfo.specName, chainInfo.specVersion));
+    /* api = await ApiPromise.create({
+      provider,
+      types,
+    }); */
   }
 
   if (fs.existsSync(storagePath)) {
@@ -83,10 +128,15 @@ async function main() {
     progressBar.stop();
   }
 
-  const metadata = await api.rpc.state.getMetadata();
-  // Populate the prefixes array
+  /* const metadata = await api.rpc.state.getMetadata(); */
+
+  const metadataHex = JSON.parse(fs.readFileSync(metadataPath, 'utf8')).metadataRpc;
+  const metadata = createMetadata(registry, metadataHex);
   const modules = JSON.parse(metadata.asLatest.modules);
+
+  // Populate the prefixes array
   modules.forEach((module) => {
+    console.log(`Checking module ${module.name}`);
     if (module.storage) {
       if (!skippedModulesPrefix.includes(module.storage.prefix)) {
         prefixes.push(xxhashAsHex(module.storage.prefix, 128));
@@ -95,17 +145,17 @@ async function main() {
   });
 
   // Generate chain spec for original and forked chains
-  execSync(binaryPath + ' build-spec --raw > ' + originalSpecPath);
-  execSync(binaryPath + ' build-spec --dev --raw > ' + forkedSpecPath);
+  execSync(`${binaryPath} build-spec --chain=${chainSpecName} --raw > ${originalSpecPath}`);
+  execSync(`${binaryPath} build-spec --chain=${chainSpecName} --raw > ${forkedSpecPath}`);
 
   let storage = JSON.parse(fs.readFileSync(storagePath, 'utf8'));
   let originalSpec = JSON.parse(fs.readFileSync(originalSpecPath, 'utf8'));
   let forkedSpec = JSON.parse(fs.readFileSync(forkedSpecPath, 'utf8'));
 
   // Modify chain name and id
-  forkedSpec.name = originalSpec.name + '-fork';
-  forkedSpec.id = originalSpec.id + '-fork';
-  forkedSpec.protocolId = originalSpec.protocolId;
+  forkedSpec.name = process.env.FORKED_SPEC_NAME || (originalSpec.name + '-fork');
+  forkedSpec.id = process.env.FORKED_SPEC_ID || (originalSpec.id + '-fork');
+  forkedSpec.protocolId = process.env.FORKED_SPEC_PROTOCOL || originalSpec.protocolId;
 
   // Grab the items to be moved, then iterate through and insert into storage
   storage
